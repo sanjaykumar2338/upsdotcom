@@ -1,0 +1,56 @@
+UPS BULK IMAGE DOWNLOADER - USER MANUAL (ORDER #2)
+==================================================
+
+OVERVIEW
+--------
+This software is the Phase 2 upgrade of the UPS Scraper. It includes a specific 
+feature to handle bulk image downloading. You now have a toggle switch (Checkbox) 
+to control whether you want to save the map files or just the data.
+
+NEW FEATURE: IMAGE TOGGLE
+-------------------------
+On the main screen, you will see a new checkbox labeled:
+[ ] Download Map Images
+
+* UNCHECKED (Default): 
+  The tool runs at maximum speed and saves only the CSV Data (Links/Dates).
+  
+* CHECKED: 
+  The tool visits every link and downloads the high-quality PNG map file 
+  to your local computer.
+
+HOW TO RUN
+----------
+1. Launch the Application ('ups_images.py' or 'UPS_Scraper.exe').
+
+2. Click "Browse" next to Input CSV and select your file containing ZIP codes.
+
+3. Click "Browse" next to Output CSV to choose where to save the report.
+
+4. **CRITICAL STEP:** Check the box labeled "Download Map Images".
+   (This tells the bot you want to save the actual image files).
+
+5. Click "START SCRAPER".
+   - A browser window will open and minimize.
+   - The status bar will show progress.
+
+WHERE ARE MY IMAGES?
+--------------------
+Once the job is finished, look inside the folder where this application is located.
+
+1. You will see a new folder named "images".
+2. Open it to find all your map files.
+3. Each file is named after its ZIP code (e.g., '90210.png') for easy matching.
+
+TROUBLESHOOTING
+---------------
+* "Folder is empty":
+  Make sure you ticked the "Download Map Images" checkbox before clicking Start.
+
+* "Process is slower":
+  Downloading images takes more time and internet bandwidth than just scraping text. 
+  Please allow the tool extra time to complete the batch.
+
+* "Windows Defender / Antivirus":
+  If the application is blocked, it is likely because it automates the 
+  Chrome browser. Please "Allow" the application to run.
