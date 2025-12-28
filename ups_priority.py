@@ -1,4 +1,4 @@
-import csv, os, sys, time, random, pathlib, threading, queue, re
+import csv, os, sys, time, random, pathlib, threading, queue, re, base64
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from urllib.parse import urljoin
 
@@ -21,10 +21,11 @@ Priority UPS Script (Order #1)
 """
 
 # ---------- Editable toggles ----------
-SAVE_IMAGES      = False         # skip image downloads to speed up scraping (data-only run)
-CONCURRENCY      = 4             # max worker threads
+SAVE_IMAGES      = False          # download map images (set False for data-only runs)
+MAX_WORKERS      = 2             # max worker threads
 HTTP_TIMEOUT     = 60            # per-request timeout (seconds)
 MAX_RETRIES      = 3             # retries per ZIP before SKIPPED
+IMAGE_RETRIES    = 3             # retries per image download
 UNRESPONSIVE_PAUSE = 120         # seconds to pause after HTTP errors before retrying
 MAINTENANCE_EVERY  = 250         # after this many processed queries: pause + clear cookies
 MAINTENANCE_PAUSE  = 5           # seconds to sleep during maintenance
@@ -40,6 +41,7 @@ HEADERS = {
 HUMAN_DELAY_RANGE_MS = (1000, 2000)  # shorter human-like delay after UPS requests (1-2 seconds)
 DEBUG_SCREENSHOT_DIR = "debug_shots"
 HEADLESS = False                  # keep False; browser is minimized immediately to stay out of the way
+os.environ.setdefault("SE_MANAGER_TELEMETRY", "0")
 
 # ---------- Thread-safe state ----------
 write_lock = threading.Lock()
@@ -88,6 +90,116 @@ def get_session():
     return thread_local.sess
 
 
+def fetch_image_via_browser(driver, url):
+    """
+    Fetch image bytes using the live browser context (respects UPS cookies).
+    Returns raw bytes or raises on failure.
+    """
+    script = """
+    const url = arguments[0];
+    const done = arguments[arguments.length - 1];
+    fetch(url, {credentials: 'include'})
+      .then(res => res.arrayBuffer())
+      .then(buf => {
+        const bytes = Array.from(new Uint8Array(buf));
+        done(btoa(String.fromCharCode.apply(null, bytes)));
+      })
+      .catch(err => done({error: String(err)}));
+    """
+    res = driver.execute_async_script(script, url)
+    if isinstance(res, dict) and res.get("error"):
+        raise RuntimeError(res["error"])
+    try:
+        return base64.b64decode(res)
+    except Exception as e:
+        raise RuntimeError(f"decode_error:{e}")
+
+
+def normalize_zip(val: str) -> str:
+    v = (val or "").strip()
+    if v.isdigit() and len(v) < 5:
+        v = v.zfill(5)
+    return v
+
+
+def is_internet_available(url: str = "https://www.google.com/generate_204", timeout: int = 4) -> bool:
+    try:
+        requests.get(url, timeout=timeout)
+        return True
+    except Exception:
+        return False
+
+
+def _detect_zip_index(headers):
+    ZIP_HEADER_ALIASES = {"zip", "zipcode", "zip_code", "zipcodes", "postal", "postalcode"}
+    for idx, h in enumerate(headers):
+        if not h:
+            continue
+        header_lower = str(h).strip().lower()
+        if header_lower in ZIP_HEADER_ALIASES:
+            return idx
+    return 0
+
+
+def read_input_rows(path: str):
+    """
+    Read ZIP rows from xlsx/csv/txt, preserving leading zeros where possible.
+    """
+    zips = []
+    p = pathlib.Path(path)
+    ext = p.suffix.lower()
+
+    if ext == ".xlsx":
+        if not openpyxl:
+            raise RuntimeError("openpyxl not installed; required for XLSX input.")
+        wb = openpyxl.load_workbook(path, read_only=True, data_only=True)
+        sheet = wb.active
+        rows = list(sheet.iter_rows(values_only=True))
+        if not rows:
+            wb.close()
+            return zips
+        headers = [c if c is not None else "" for c in rows[0]]
+        zip_idx = _detect_zip_index(headers)
+        data_rows = rows[1:] if any(headers) else rows
+        for row in data_rows:
+            if not row:
+                continue
+            val = row[zip_idx] if zip_idx < len(row) else None
+            if val is None:
+                continue
+            if isinstance(val, (int, float)):
+                val = str(int(val))
+            z = normalize_zip(str(val))
+            if z:
+                zips.append(z)
+        wb.close()
+    elif ext == ".csv":
+        with open(path, encoding="utf-8-sig", newline="") as f:
+            reader = csv.reader(f)
+            rows = list(reader)
+        if not rows:
+            return zips
+        headers = rows[0]
+        zip_idx = _detect_zip_index(headers)
+        data_rows = rows[1:] if any(headers) else rows
+        for row in data_rows:
+            if not row:
+                continue
+            val = row[zip_idx] if zip_idx < len(row) else ""
+            z = normalize_zip(str(val))
+            if z:
+                zips.append(z)
+    elif ext == ".txt":
+        with open(path, encoding="utf-8-sig") as f:
+            for line in f:
+                z = normalize_zip(line.strip())
+                if z:
+                    zips.append(z)
+    else:
+        raise RuntimeError("Unsupported input type. Use .xlsx, .csv, or .txt")
+    return zips
+
+
 def get_browser():
     """
     Return a Selenium Chrome driver for this thread. Creates if missing.
@@ -129,25 +241,25 @@ def close_all_browsers():
 
 def ensure_header(path):
     cols = [
-        "ZIP CODE",
+        "ZIP",
         "CITY",
         "STATE",
-        "ZIP",
-        "SHIP DATE",
-        "LOCATION (TEXT INFO)",
-        "URL DISPLAYED FOR IMAGE (TEXT INFO)",
-        "IMAGE FILE",
+        "SHIP_DATE",
+        "LOCATION_TEXT",
+        "IMAGE_URL",
+        "IMAGE_FILE",
         "STATUS",
-        "ERROR",
+        "ERROR_STEP",
+        "ERROR_TYPE",
+        "ERROR_MESSAGE",
+        "RAW_URL",
     ]
 
-    # If file missing or empty: write header.
     if (not os.path.exists(path)) or os.path.getsize(path) == 0:
         with open(path, "w", newline="", encoding="utf-8") as fp:
             csv.writer(fp).writerow(cols)
         return cols
 
-    # If file exists but header is missing/mismatched, rewrite with header + existing rows.
     try:
         with open(path, newline="", encoding="utf-8") as fp:
             reader = csv.reader(fp)
@@ -157,9 +269,8 @@ def ensure_header(path):
                 with open(path, "w", newline="", encoding="utf-8") as out:
                     w = csv.writer(out)
                     w.writerow(cols)
-                    w.writerows(r for r in rows if r)  # keep existing data
+                    w.writerows(r for r in rows if r)
     except Exception:
-        # On any read error, fall back to writing header only (data append will continue).
         with open(path, "w", newline="", encoding="utf-8") as fp:
             csv.writer(fp).writerow(cols)
     return cols
@@ -182,6 +293,29 @@ def append_row(path, cols, row, tries=20, base_sleep=0.25):
         if fp.tell() == 0:
             w.writeheader()
         w.writerow(row)
+
+
+def make_error(error_step, error_type, message):
+    error_step = (error_step or "").strip()
+    error_type = (error_type or "").strip()
+    message = (message or "").strip()
+    return error_step, error_type, message[:250]
+
+
+def load_processed_zips(path):
+    processed = set()
+    if not os.path.exists(path):
+        return processed
+    try:
+        with open(path, newline="", encoding="utf-8") as fp:
+            reader = csv.DictReader(fp)
+            for row in reader:
+                z = (row.get("ZIP") or "").strip()
+                if z:
+                    processed.add(z)
+    except Exception:
+        pass
+    return processed
 
 
 def wait_if_paused():
@@ -427,18 +561,36 @@ def debug_headful(zipcode: str) -> Optional[str]:
 
 
 def process_zip(zipcode, cols, out_path, image_dir):
-    zipcode = str(zipcode).strip()
+    zipcode_raw = str(zipcode).strip()
+    zipcode = normalize_zip(zipcode_raw)
     with stats_lock:
         stats["last"] = zipcode
     log(f"[START] ZIP {zipcode}")
+
+    parsed = {"city": "", "state": "", "zip": "", "ship_date": "", "location_text": "", "image_url": ""}
+    img_path = ""
+    error_message = ""
+    error_type = ""
+    error_step = ""
+    status_val = "SKIPPED"
+
     try:
-        last_err = ""
         attempts = 0
         while attempts < MAX_RETRIES and not stop_event.is_set():
             if not wait_if_paused():
                 break
+
+            if not is_internet_available():
+                error_step, error_type, error_message = make_error(
+                    "OFFLINE", "NO_INTERNET", "Internet not available; paused and retrying."
+                )
+                log("[NET] No internet connection detected. Pausing 120s.")
+                time.sleep(UNRESPONSIVE_PAUSE)
+                continue
+
             maybe_maintenance()
             attempts += 1
+
             try:
                 from selenium.common.exceptions import TimeoutException, WebDriverException
                 from selenium.webdriver.common.by import By
@@ -451,8 +603,10 @@ def process_zip(zipcode, cols, out_path, image_dir):
 
                 try:
                     driver.get(BASE_URL)
-                except WebDriverException as e:
-                    last_err = f"load:{e}"
+                except WebDriverException:
+                    error_step, error_type, error_message = make_error(
+                        "LOAD_PAGE", "TIMEOUT", "Timeout / Site not responding"
+                    )
                     bump_session_version()
                     continue
 
@@ -467,12 +621,15 @@ def process_zip(zipcode, cols, out_path, image_dir):
                     )
                     field.clear()
                     field.send_keys(zipcode)
-                except Exception as e:
-                    last_err = f"zip_input:{e}"
+                except Exception:
+                    error_step, error_type, error_message = make_error(
+                        "FIND_INPUT",
+                        "CAPTCHA_OR_BLOCKED",
+                        "ZIP input not found (captcha/block/DOM changed).",
+                    )
                     bump_session_version()
                     continue
 
-                clicked = False
                 try:
                     btn = wait.until(
                         EC.element_to_be_clickable(
@@ -480,54 +637,36 @@ def process_zip(zipcode, cols, out_path, image_dir):
                         )
                     )
                     btn.click()
-                    clicked = True
                 except Exception:
                     try:
                         field.send_keys(Keys.ENTER)
-                        clicked = True
                     except Exception:
                         pass
 
                 try:
                     wait.until(EC.presence_of_element_located((By.CSS_SELECTOR, "img#imgMap, img[src*='servicemaps']")))
                 except TimeoutException:
-                    last_err = "timeout_result"
+                    error_step, error_type, error_message = make_error(
+                        "WAIT_RESULT", "RESULT_TIMEOUT", "Timed out waiting for results/map image."
+                    )
                     bump_session_version()
                     continue
 
                 html = driver.page_source
                 parsed = parse_results(html)
                 if not parsed["location_text"]:
-                    if attempts >= MAX_RETRIES:
-                        row = {
-                            "ZIP CODE": zipcode,
-                            "CITY": "",
-                            "STATE": "",
-                            "ZIP": "",
-                            "SHIP DATE": "",
-                            "LOCATION (TEXT INFO)": "",
-                            "URL DISPLAYED FOR IMAGE (TEXT INFO)": "",
-                            "IMAGE FILE": "",
-                            "STATUS": "SKIPPED",
-                            "ERROR": "parse_failed",
-                        }
-                        append_row(out_path, cols, row)
-                        record_processed(skipped=True)
-                        log(f"[SKIPPED] ZIP {zipcode} | error=parse_failed")
-                        return
-                    # try again after refreshing
+                    error_step, error_type, error_message = make_error(
+                        "PARSE", "PARSE_FAILED", "Result loaded but expected fields not found."
+                    )
                     bump_session_version()
                     continue
 
-                img_path = ""
-                img_error = ""
                 img_url = parsed["image_url"]
+                img_error = ""
                 if img_url and SAVE_IMAGES:
                     try:
                         full_img_url = urljoin(BASE_URL, img_url)
 
-                        # Copy cookies + User-Agent from the active Selenium session so UPS treats
-                        # the image download the same as the browser view.
                         session = requests.Session()
                         for cookie in driver.get_cookies():
                             session.cookies.set(cookie["name"], cookie["value"])
@@ -537,73 +676,93 @@ def process_zip(zipcode, cols, out_path, image_dir):
                             user_agent = ""
                         if user_agent:
                             session.headers.update({"User-Agent": user_agent})
+                        session.headers.update({"Referer": BASE_URL})
 
-                        img_resp = session.get(full_img_url, timeout=HTTP_TIMEOUT)
-                        img_resp.raise_for_status()
-
-                        img_name = f"{zipcode}.png"
+                        base_name = os.path.basename(full_img_url.split("?")[0])
+                        ext = pathlib.Path(base_name).suffix or ""
+                        img_name = f"{zipcode}{ext or '.png'}"
                         dest = image_dir / img_name
                         dest.parent.mkdir(parents=True, exist_ok=True)
-                        with open(dest, "wb") as fp:
-                            fp.write(img_resp.content)
-                        img_path = str(dest)
-                    except Exception as e:
-                        img_error = f"img_download_error:{e}"
 
-                row = {
-                    "ZIP CODE": zipcode,
-                    "CITY": parsed["city"],
-                    "STATE": parsed["state"],
-                    "ZIP": parsed["zip"],
-                    "SHIP DATE": parsed["ship_date"],
-                    "LOCATION (TEXT INFO)": parsed["location_text"],
-                    "URL DISPLAYED FOR IMAGE (TEXT INFO)": urljoin(BASE_URL, img_url) if img_url else "",
-                    "IMAGE FILE": img_path,
-                    # Even if the image download fails, treat data extraction as success and leave error blank.
-                    "STATUS": "OK",
-                    "ERROR": "",
-                }
-                append_row(out_path, cols, row)
-                record_processed(skipped=False)
-                log(f"[OK] ZIP {zipcode} | location={parsed['location_text']} | img_url={'yes' if img_url else 'no'}")
-                return
+                        last_exc = None
+                        got_bytes = None
+                        for attempt in range(1, IMAGE_RETRIES + 1):
+                            try:
+                                img_resp = session.get(full_img_url, timeout=HTTP_TIMEOUT, allow_redirects=True)
+                                img_resp.raise_for_status()
+                                got_bytes = img_resp.content
+                                if not ext:
+                                    ctype = img_resp.headers.get("Content-Type", "")
+                                    if "png" in ctype:
+                                        ext = ".png"
+                                    elif "gif" in ctype:
+                                        ext = ".gif"
+                                    elif "jpeg" in ctype or "jpg" in ctype:
+                                        ext = ".jpg"
+                                    img_name = f"{zipcode}{ext or '.png'}"
+                                    dest = image_dir / img_name
+                                last_exc = None
+                                break
+                            except Exception as e:
+                                last_exc = e
+                                log(f"[IMG-RETRY] ZIP {zipcode} attempt {attempt}/{IMAGE_RETRIES} failed: {e}")
+                                time.sleep(1.5 * attempt)
+                        if got_bytes is None and last_exc:
+                            try:
+                                got_bytes = fetch_image_via_browser(driver, full_img_url)
+                                last_exc = None
+                            except Exception as e:
+                                last_exc = e
+                        if got_bytes is None and last_exc:
+                            raise last_exc
+                        with open(dest, "wb") as fp:
+                            fp.write(got_bytes)
+                        rel_path = os.path.relpath(dest, pathlib.Path(out_path).parent)
+                        img_path = rel_path
+                        log(f"[IMG] Saved {img_path}")
+                    except Exception as e:
+                        img_error = f"Image download failed: {e}"
+                        error_step, error_type, error_message = make_error(
+                            "DOWNLOAD_IMAGE", "IMAGE_TIMEOUT", img_error
+                        )
+                        log(f"[IMG-ERR] ZIP {zipcode} | {img_error}")
+
+                if img_error:
+                    status_val = "OK_WITH_IMAGE_ERROR"
+                else:
+                    status_val = "OK"
+                break
             finally:
                 sleep_time = random.uniform(HUMAN_DELAY_RANGE_MS[0], HUMAN_DELAY_RANGE_MS[1]) / 1000.0
                 log(f"[WAIT] {sleep_time:.2f}s before next request")
                 time.sleep(sleep_time)
 
-        if attempts >= MAX_RETRIES:
-            row = {
-                "ZIP CODE": zipcode,
-                "CITY": "",
-                "STATE": "",
-                "ZIP": "",
-                "SHIP DATE": "",
-                "LOCATION (TEXT INFO)": "",
-                "URL DISPLAYED FOR IMAGE (TEXT INFO)": "",
-                "IMAGE FILE": "",
-                "STATUS": "SKIPPED",
-                "ERROR": last_err or "max_retries",
-            }
-            append_row(out_path, cols, row)
-            record_processed(skipped=True)
-            log(f"[SKIPPED] ZIP {zipcode} | error={last_err or 'max_retries'}")
+        if status_val not in ("OK", "OK_WITH_IMAGE_ERROR"):
+            status_val = "SKIPPED"
+            if not error_message:
+                error_step, error_type, error_message = make_error("UNKNOWN", "UNKNOWN", "Timeout / Site not responding")
     except Exception as e:
+        status_val = "ERROR"
+        error_step, error_type, error_message = make_error("UNEXPECTED", "EXCEPTION", f"Unexpected error: {e}")
         log(f"[ERROR] ZIP {zipcode}: {e}")
-        row = {
-            "ZIP CODE": zipcode,
-            "CITY": "",
-            "STATE": "",
-            "ZIP": "",
-            "SHIP DATE": "",
-            "LOCATION (TEXT INFO)": "",
-            "URL DISPLAYED FOR IMAGE (TEXT INFO)": "",
-            "IMAGE FILE": "",
-            "STATUS": "SKIPPED",
-            "ERROR": f"exception:{e}",
-        }
-        append_row(out_path, cols, row)
-        record_processed(skipped=True)
+
+    row = {
+        "ZIP": zipcode,
+        "CITY": parsed.get("city", ""),
+        "STATE": parsed.get("state", ""),
+        "SHIP_DATE": parsed.get("ship_date", ""),
+        "LOCATION_TEXT": parsed.get("location_text", ""),
+        "IMAGE_URL": urljoin(BASE_URL, parsed.get("image_url", "")) if parsed.get("image_url") else "",
+        "IMAGE_FILE": img_path,
+        "STATUS": status_val,
+        "ERROR_STEP": error_step,
+        "ERROR_TYPE": error_type,
+        "ERROR_MESSAGE": error_message or "",
+        "RAW_URL": BASE_URL,
+    }
+    append_row(out_path, cols, row)
+    record_processed(skipped=(status_val != "OK"))
+    log(f"[{status_val}] ZIP {zipcode} | location={parsed.get('location_text','')} | img_url={'yes' if parsed.get('image_url') else 'no'} | err={error_message}")
 
 
 def run_batch(input_path, output_path):
@@ -611,17 +770,28 @@ def run_batch(input_path, output_path):
         import selenium  # noqa: F401
     except ImportError:
         raise RuntimeError("selenium not installed. Install with: py -m pip install selenium")
-    zips = load_zips(input_path)
+    zips = read_input_rows(input_path)
     if not zips:
         raise RuntimeError("No ZIP codes found in input.")
-    with stats_lock:
-        stats["total"] = len(zips)
-    log(f"[JOB] Starting batch | total={len(zips)} | input={input_path} | output={output_path}")
     out_path = str(pathlib.Path(output_path).resolve())
     cols = ensure_header(out_path)
+    already = load_processed_zips(out_path)
+    if already:
+        zips = [z for z in zips if z not in already]
+        log(f"[JOB] Skipping {len(already)} already-processed ZIPs from existing output.")
+    if not zips:
+        log("[JOB] Nothing to do; all ZIPs already processed.")
+        return
+    with stats_lock:
+        stats["total"] = len(zips)
+    log(f"[JOB] Starting batch | total={len(zips)} | input={input_path} | output={output_path} | images={SAVE_IMAGES}")
     image_dir = pathlib.Path(output_path).resolve().parent / "images"
+    if SAVE_IMAGES:
+        image_dir.mkdir(parents=True, exist_ok=True)
+    else:
+        log("[INFO] Image download is OFF. Only data will be saved.")
 
-    with ThreadPoolExecutor(max_workers=CONCURRENCY) as ex:
+    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as ex:
         futs = {ex.submit(process_zip, z, cols, out_path, image_dir): z for z in zips}
         for _ in as_completed(futs):
             if stop_event.is_set():
@@ -660,7 +830,7 @@ def launch_gui():
     def choose_input():
         path = filedialog.askopenfilename(
             title="Select input file",
-            filetypes=[("CSV/XLSX", "*.csv;*.xlsx;*.xlsm;*.xls"), ("All files", "*.*")],
+            filetypes=[("CSV/XLSX/TXT", "*.csv;*.xlsx;*.xlsm;*.xls;*.txt"), ("All files", "*.*")],
         )
         if path:
             input_var.set(path)
@@ -790,9 +960,18 @@ def launch_gui():
         padx=14,
     ).grid(row=1, column=2)
 
+    # Note about leading zeros
+    tk.Label(
+        main,
+        text="Tip: Use XLSX if ZIPs have leading zeros (00001). CSV/TXT edited in Excel may drop zeros.",
+        bg=BG,
+        fg=FG_SUB,
+        font=("Helvetica", 10),
+    ).grid(row=2, column=0, columnspan=3, sticky="w", pady=(4, 6))
+
     # Action buttons row
     btn_frame = tk.Frame(main, bg=BG)
-    btn_frame.grid(row=2, column=0, columnspan=3, pady=14, sticky="w")
+    btn_frame.grid(row=3, column=0, columnspan=3, pady=14, sticky="w")
     btn_frame.columnconfigure((0, 1, 2), weight=1, uniform="btns")
 
     tk.Button(
@@ -845,7 +1024,7 @@ def launch_gui():
         bg=BG,
         fg=FG_SUB,
     )
-    status_label.grid(row=3, column=0, columnspan=3, pady=(6, 0), sticky="w")
+    status_label.grid(row=4, column=0, columnspan=3, pady=(6, 0), sticky="w")
 
     refresh_status()
     app.protocol("WM_DELETE_WINDOW", on_close)

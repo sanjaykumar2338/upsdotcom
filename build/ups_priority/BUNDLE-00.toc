@@ -1,0 +1,4 @@
+([('ups_priority',
+   '/Applications/XAMPP/xamppfiles/htdocs/myworkplace/fiverr/aps1000 '
+   '2/dist/ups_priority',
+   'EXECUTABLE')],)
