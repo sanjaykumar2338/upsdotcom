@@ -599,7 +599,7 @@ def process_zip(zipcode, cols, out_path, image_dir):
                 from selenium.webdriver.support import expected_conditions as EC
 
                 driver = get_browser()
-                wait = WebDriverWait(driver, 25)
+                wait = WebDriverWait(driver, 10)
 
                 try:
                     driver.get(BASE_URL)
@@ -643,8 +643,19 @@ def process_zip(zipcode, cols, out_path, image_dir):
                     except Exception:
                         pass
 
+                def result_or_error(d):
+                    try:
+                        if d.find_elements(By.CSS_SELECTOR, "img#imgMap, img[src*='servicemaps']"):
+                            return True
+                        ps = (d.page_source or "").lower()
+                        if ("no information for zip code" in ps) or ("either the zip code does not exist" in ps):
+                            return True
+                        return False
+                    except Exception:
+                        return False
+
                 try:
-                    wait.until(EC.presence_of_element_located((By.CSS_SELECTOR, "img#imgMap, img[src*='servicemaps']")))
+                    wait.until(result_or_error)
                 except TimeoutException:
                     error_step, error_type, error_message = make_error(
                         "WAIT_RESULT", "RESULT_TIMEOUT", "Timed out waiting for results/map image."
@@ -655,6 +666,13 @@ def process_zip(zipcode, cols, out_path, image_dir):
                 html = driver.page_source
                 parsed = parse_results(html)
                 if not parsed["location_text"]:
+                    lower_ps = html.lower()
+                    if ("no information for zip code" in lower_ps) or ("either the zip code does not exist" in lower_ps):
+                        error_step, error_type, error_message = make_error(
+                            "WAIT_RESULT", "NO_DATA", "No information for ZIP code"
+                        )
+                        status_val = "SKIPPED"
+                        break
                     error_step, error_type, error_message = make_error(
                         "PARSE", "PARSE_FAILED", "Result loaded but expected fields not found."
                     )

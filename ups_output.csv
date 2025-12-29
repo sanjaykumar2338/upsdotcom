@@ -1,8 +1,8 @@
 ZIP,CITY,STATE,SHIP_DATE,LOCATION_TEXT,IMAGE_URL,IMAGE_FILE,STATUS,ERROR_STEP,ERROR_TYPE,ERROR_MESSAGE,RAW_URL
-20101,DULLES,VA,12/28/2025,"DULLES, VA 20101",https://www.ups.com/using/services/servicemaps/maps25/map_0181_NOV25.gif,,OK,,,,https://www.ups.com/maps/?loc=en_CB
-10001,NEW YORK,NY,12/28/2025,"NEW YORK, NY 10001",https://www.ups.com/using/services/servicemaps/maps25/map_0076_NOV25.gif,,OK,,,,https://www.ups.com/maps/?loc=en_CB
-90210,BEVERLY HILLS,CA,12/28/2025,"BEVERLY HILLS, CA 90210",https://www.ups.com/using/services/servicemaps/maps25/map_1011_NOV25.gif,,OK,,,,https://www.ups.com/maps/?loc=en_CB
-33101,MIAMI,FL,12/28/2025,"MIAMI, FL 33101",https://www.ups.com/using/services/servicemaps/maps25/map_0333_NOV25.gif,,OK,,,,https://www.ups.com/maps/?loc=en_CB
-60601,CHICAGO,IL,12/28/2025,"CHICAGO, IL 60601",https://www.ups.com/using/services/servicemaps/maps25/map_0714_NOV25.gif,,OK,,,,https://www.ups.com/maps/?loc=en_CB
-75201,DALLAS,TX,12/28/2025,"DALLAS, TX 75201",https://www.ups.com/using/services/servicemaps/maps25/map_0854_NOV25.gif,,OK,,,,https://www.ups.com/maps/?loc=en_CB
-98101,SEATTLE,WA,12/28/2025,"SEATTLE, WA 98101",https://www.ups.com/using/services/servicemaps/maps25/map_1102_NOV25.gif,,OK,,,,https://www.ups.com/maps/?loc=en_CB
+20101,DULLES,VA,12/29/2025,"DULLES, VA 20101",https://www.ups.com/using/services/servicemaps/maps25/map_0181_NOV25.gif,,OK,,,,https://www.ups.com/maps/?loc=en_CB
+10001,NEW YORK,NY,12/29/2025,"NEW YORK, NY 10001",https://www.ups.com/using/services/servicemaps/maps25/map_0076_NOV25.gif,,OK,,,,https://www.ups.com/maps/?loc=en_CB
+90210,BEVERLY HILLS,CA,12/29/2025,"BEVERLY HILLS, CA 90210",https://www.ups.com/using/services/servicemaps/maps25/map_1011_NOV25.gif,,OK,,,,https://www.ups.com/maps/?loc=en_CB
+33101,MIAMI,FL,12/29/2025,"MIAMI, FL 33101",https://www.ups.com/using/services/servicemaps/maps25/map_0333_NOV25.gif,,OK,,,,https://www.ups.com/maps/?loc=en_CB
+75201,DALLAS,TX,12/29/2025,"DALLAS, TX 75201",https://www.ups.com/using/services/servicemaps/maps25/map_0854_NOV25.gif,,OK,,,,https://www.ups.com/maps/?loc=en_CB
+60601,CHICAGO,IL,12/29/2025,"CHICAGO, IL 60601",https://www.ups.com/using/services/servicemaps/maps25/map_0714_NOV25.gif,,OK,,,,https://www.ups.com/maps/?loc=en_CB
+98101,SEATTLE,WA,12/29/2025,"SEATTLE, WA 98101",https://www.ups.com/using/services/servicemaps/maps25/map_1102_NOV25.gif,,OK,,,,https://www.ups.com/maps/?loc=en_CB
