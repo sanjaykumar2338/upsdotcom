@@ -22,7 +22,7 @@ Priority UPS Script (Order #1)
 
 # ---------- Editable toggles ----------
 SAVE_IMAGES      = False          # download map images (set False for data-only runs)
-MAX_WORKERS      = 2             # max worker threads
+MAX_WORKERS      = 4             # max worker threads
 HTTP_TIMEOUT     = 60            # per-request timeout (seconds)
 MAX_RETRIES      = 3             # retries per ZIP before SKIPPED
 IMAGE_RETRIES    = 3             # retries per image download
@@ -40,7 +40,9 @@ HEADERS = {
 }
 HUMAN_DELAY_RANGE_MS = (1000, 2000)  # shorter human-like delay after UPS requests (1-2 seconds)
 DEBUG_SCREENSHOT_DIR = "debug_shots"
-HEADLESS = False                  # keep False; browser is minimized immediately to stay out of the way
+HEADLESS = False                  # use normal browser; set True for silent headless runs
+BLOCK_IMAGES = True
+BLOCK_FONTS = True
 os.environ.setdefault("SE_MANAGER_TELEMETRY", "0")
 
 # ---------- Thread-safe state ----------
@@ -203,7 +205,6 @@ def read_input_rows(path: str):
 def get_browser():
     """
     Return a Selenium Chrome driver for this thread. Creates if missing.
-    Runs visible (not headless) to satisfy UPS, then minimizes to stay unobtrusive.
     """
     if hasattr(thread_local, "driver") and thread_local.driver:
         return thread_local.driver
@@ -215,12 +216,34 @@ def get_browser():
     options = webdriver.ChromeOptions()
     options.add_argument("--disable-blink-features=AutomationControlled")
     options.add_argument("--start-maximized")
+    options.add_argument("--disable-gpu")
+    options.add_argument("--no-sandbox")
+    options.add_argument("--disable-dev-shm-usage")
+    options.add_argument("--disable-background-networking")
+    options.add_argument("--disable-background-timer-throttling")
+    options.add_argument("--disable-backgrounding-occluded-windows")
+    options.add_argument("--disable-renderer-backgrounding")
+    options.add_argument("--disable-features=Translate,MediaRouter")
+    options.add_argument("--window-size=1280,900")
+    if HEADLESS:
+        options.add_argument("--headless=new")
+    try:
+        options.set_capability("pageLoadStrategy", "eager")
+    except Exception:
+        pass
+    prefs = {"profile.default_content_setting_values.notifications": 2}
+    if BLOCK_IMAGES:
+        prefs["profile.managed_default_content_settings.images"] = 2
+    if BLOCK_FONTS:
+        prefs["profile.managed_default_content_settings.fonts"] = 2
+    options.add_experimental_option("prefs", prefs)
 
     driver = webdriver.Chrome(options=options)
     with browser_lock:
         drivers.append(driver)
     try:
-        driver.minimize_window()
+        if not HEADLESS:
+            driver.minimize_window()
     except Exception:
         pass
     driver.set_page_load_timeout(HTTP_TIMEOUT)
