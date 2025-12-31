@@ -31,6 +31,11 @@ MAINTENANCE_EVERY  = 250         # after this many processed queries: pause + cl
 MAINTENANCE_PAUSE  = 5           # seconds to sleep during maintenance
 USER_AGENT       = "Mozilla/5.0 (PriorityUPS/1.0)"
 BASE_URL         = "https://www.ups.com/maps/?loc=en_CB"
+NO_DATA_TEXT_SNIPPETS = [
+    "there is no information for zip code",
+    "either the zip code does not exist",
+    "entered incorrectly",
+]
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
     "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
@@ -325,6 +330,90 @@ def make_error(error_step, error_type, message):
     return error_step, error_type, message[:250]
 
 
+def get_body_text_lower(driver):
+    from selenium.webdriver.common.by import By
+
+    try:
+        body = driver.find_element(By.TAG_NAME, "body")
+        return (body.text or "").lower()
+    except Exception:
+        return ""
+
+
+def _inner_text(driver, elem):
+    try:
+        txt = driver.execute_script("return arguments[0].innerText;", elem)
+        if txt:
+            return txt
+    except Exception:
+        pass
+    try:
+        return elem.text or ""
+    except Exception:
+        return ""
+
+
+def extract_visible_error_text(driver):
+    """
+    Grab the visible error text from the UPS error page (DOM-based).
+    Tries main, then any element containing 'Error', then any element mentioning 'no information for zip code'.
+    """
+    from selenium.webdriver.common.by import By
+
+    def norm(txt):
+        return _space(txt)
+
+    body_text = ""
+    try:
+        body_text = driver.find_element(By.TAG_NAME, "body").text or ""
+    except Exception:
+        body_text = ""
+
+    # 1) main tag
+    try:
+        mains = driver.find_elements(By.TAG_NAME, "main")
+        for m in mains:
+            t = norm(_inner_text(driver, m))
+            if t:
+                return t
+    except Exception:
+        pass
+
+    # 2) elements containing heading Error
+    try:
+        candidates = driver.find_elements(By.XPATH, "//*[contains(translate(., 'ERROR', 'error'),'error')]")
+        for c in candidates:
+            t = norm(_inner_text(driver, c))
+            if t:
+                return t
+    except Exception:
+        pass
+
+    # 3) elements mentioning no information for zip code
+    try:
+        candidates = driver.find_elements(
+            By.XPATH, "//*[contains(translate(., 'NO INFORMATION FOR ZIP CODE', 'no information for zip code'),'no information for zip code')]"
+        )
+        for c in candidates:
+            t = norm(_inner_text(driver, c))
+            if t:
+                return t
+    except Exception:
+        pass
+
+    return norm(body_text)
+
+
+def extract_zip_from_error_text(error_text: str) -> str:
+    if not error_text:
+        return ""
+    m = re.search(r"(?:zip\\s*code\\s*[:\\s]*)(\\d{5})", error_text, re.I)
+    if m:
+        return m.group(1)
+    m = re.search(r"(\\d{5})", error_text)
+    return m.group(1) if m else ""
+
+
 def load_processed_zips(path):
     processed = set()
     if not os.path.exists(path):
@@ -394,6 +483,49 @@ def maybe_maintenance():
             time.sleep(MAINTENANCE_PAUSE)
             return True
     return False
+
+
+def detect_no_info_state(driver):
+    txt = get_body_text_lower(driver)
+    state = None
+    if any(snippet in txt for snippet in NO_DATA_TEXT_SNIPPETS) or (
+        "u.s. ground maps" in txt and "error" in txt and "no information" in txt
+    ):
+        state = "NO_DATA"
+    if state:
+        error_text = extract_visible_error_text(driver)
+        page_zip = extract_zip_from_error_text(error_text)
+        return {"status": "NO_DATA", "error_text": error_text, "page_zip": page_zip}
+    return None
+
+
+def wait_for_result_or_terminal_state(driver, prev_src, prev_txt, timeout=8):
+    from selenium.webdriver.common.by import By
+
+    end = time.time() + timeout
+
+    early = detect_no_info_state(driver)
+    if early:
+        return early
+
+    while time.time() < end:
+        state = detect_no_info_state(driver)
+        if state:
+            return state
+
+        try:
+            src = driver.find_element(By.CSS_SELECTOR, "img#imgMap, img[src*='servicemaps']").get_attribute("src") or ""
+        except Exception:
+            src = ""
+        try:
+            bold_txt = driver.find_element(By.CSS_SELECTOR, "span.bold").text or ""
+        except Exception:
+            bold_txt = ""
+        if (src and src != prev_src) or (bold_txt and bold_txt != prev_txt):
+            return {"status": "OK", "img_src": src, "bold": bold_txt}
+        time.sleep(0.25)
+
+    return {"status": "TIMEOUT", "err": "Timed out waiting for results OR error state", "img_src": "", "bold": ""}
 
 
 def record_processed(skipped=False):
@@ -665,23 +797,39 @@ def process_zip(zipcode, cols, out_path, image_dir):
                         field.send_keys(Keys.ENTER)
                     except Exception:
                         pass
-
-                def result_or_error(d):
-                    try:
-                        if d.find_elements(By.CSS_SELECTOR, "img#imgMap, img[src*='servicemaps']"):
-                            return True
-                        ps = (d.page_source or "").lower()
-                        if ("no information for zip code" in ps) or ("either the zip code does not exist" in ps):
-                            return True
-                        return False
-                    except Exception:
-                        return False
-
                 try:
-                    wait.until(result_or_error)
-                except TimeoutException:
+                    prev_src = driver.find_element(By.CSS_SELECTOR, "img#imgMap, img[src*='servicemaps']").get_attribute("src") or ""
+                except Exception:
+                    prev_src = ""
+                prev_txt = ""
+                try:
+                    prev_txt = driver.find_element(By.CSS_SELECTOR, "span.bold").text or ""
+                except Exception:
+                    prev_txt = ""
+
+                result_state = wait_for_result_or_terminal_state(driver, prev_src, prev_txt, timeout=8)
+                if result_state.get("status") == "NO_DATA":
+                    page_error = (result_state.get("error_text") or "").strip()
+                    page_zip = result_state.get("page_zip") or ""
+                    if page_zip and page_zip not in page_error:
+                        page_error = f"{page_error} (page_zip_detected={page_zip})" if page_error else f"page_zip_detected={page_zip}"
+                    if not page_error:
+                        page_error = "NO_DATA page detected but error text not found"
+                    error_step, error_type, error_message = make_error("WAIT_RESULT", "NO_DATA", page_error)
+                    log(f"[NO_DATA][DOM] error_text=\"{page_error[:120]}\" page_zip={page_zip}")
+                    status_val = "SKIPPED"
+                    parsed = {"city": "", "state": "", "zip": "", "ship_date": "", "location_text": "", "image_url": ""}
+                    try:
+                        driver.get(BASE_URL)
+                    except Exception:
+                        pass
+                    thread_local.page_loaded = False
+                    break
+                if result_state.get("status") == "TIMEOUT":
                     error_step, error_type, error_message = make_error(
-                        "WAIT_RESULT", "RESULT_TIMEOUT", "Timed out waiting for results/map image."
+                        "WAIT_RESULT",
+                        "RESULT_TIMEOUT",
+                        result_state.get("err", "Timed out waiting for results OR error state"),
                     )
                     bump_session_version()
                     continue
@@ -689,13 +837,6 @@ def process_zip(zipcode, cols, out_path, image_dir):
                 html = driver.page_source
                 parsed = parse_results(html)
                 if not parsed["location_text"]:
-                    lower_ps = html.lower()
-                    if ("no information for zip code" in lower_ps) or ("either the zip code does not exist" in lower_ps):
-                        error_step, error_type, error_message = make_error(
-                            "WAIT_RESULT", "NO_DATA", "No information for ZIP code"
-                        )
-                        status_val = "SKIPPED"
-                        break
                     error_step, error_type, error_message = make_error(
                         "PARSE", "PARSE_FAILED", "Result loaded but expected fields not found."
                     )
