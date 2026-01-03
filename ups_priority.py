@@ -22,7 +22,7 @@ Priority UPS Script (Order #1)
 
 # ---------- Editable toggles ----------
 SAVE_IMAGES      = False          # download map images (set False for data-only runs)
-MAX_WORKERS      = 1             # max worker threads
+MAX_WORKERS      = 3             # max worker threads
 HTTP_TIMEOUT     = 60            # per-request timeout (seconds)
 MAX_RETRIES      = 3             # retries per ZIP before SKIPPED
 IMAGE_RETRIES    = 3             # retries per image download
