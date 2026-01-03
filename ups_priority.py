@@ -22,7 +22,7 @@ Priority UPS Script (Order #1)
 
 # ---------- Editable toggles ----------
 SAVE_IMAGES      = False          # download map images (set False for data-only runs)
-MAX_WORKERS      = 4             # max worker threads
+MAX_WORKERS      = 1             # max worker threads
 HTTP_TIMEOUT     = 60            # per-request timeout (seconds)
 MAX_RETRIES      = 3             # retries per ZIP before SKIPPED
 IMAGE_RETRIES    = 3             # retries per image download
@@ -43,7 +43,8 @@ HEADERS = {
     "Connection": "keep-alive",
     "Upgrade-Insecure-Requests": "1",
 }
-HUMAN_DELAY_RANGE_MS = (1000, 2000)  # shorter human-like delay after UPS requests (1-2 seconds)
+HUMAN_DELAY_RANGE_MS = (3000, 4000)  # slow down per-request pacing to ~3-4 seconds
+RESULT_WAIT_RANGE_MS = (3000, 4000)  # wait on result page before parsing (3-4 seconds)
 DEBUG_SCREENSHOT_DIR = "debug_shots"
 HEADLESS = False                  # use normal browser; set True for silent headless runs
 BLOCK_IMAGES = True
@@ -363,6 +364,24 @@ def extract_visible_error_text(driver):
     def norm(txt):
         return _space(txt)
 
+    def trim_login_noise(txt: str) -> str:
+        if not txt:
+            return ""
+        key = "u.s. ground maps"
+        end_phrase = "either the zip code does not exist or it was entered incorrectly"
+        low = txt.lower()
+        start = 0
+        if key in low:
+            start = low.index(key)
+        elif "error" in low:
+            start = low.index("error")
+        trimmed = txt[start:].strip()
+        low_trim = trimmed.lower()
+        if end_phrase in low_trim:
+            end_idx = low_trim.index(end_phrase) + len(end_phrase)
+            trimmed = trimmed[:end_idx].strip()
+        return _space(trimmed)
+
     body_text = ""
     try:
         body_text = driver.find_element(By.TAG_NAME, "body").text or ""
@@ -375,7 +394,7 @@ def extract_visible_error_text(driver):
         for m in mains:
             t = norm(_inner_text(driver, m))
             if t:
-                return t
+                return trim_login_noise(t)
     except Exception:
         pass
 
@@ -385,7 +404,7 @@ def extract_visible_error_text(driver):
         for c in candidates:
             t = norm(_inner_text(driver, c))
             if t:
-                return t
+                return trim_login_noise(t)
     except Exception:
         pass
 
@@ -397,11 +416,11 @@ def extract_visible_error_text(driver):
         for c in candidates:
             t = norm(_inner_text(driver, c))
             if t:
-                return t
+                return trim_login_noise(t)
     except Exception:
         pass
 
-    return norm(body_text)
+    return trim_login_noise(norm(body_text))
 
 
 def extract_zip_from_error_text(error_text: str) -> str:
@@ -530,11 +549,17 @@ def wait_for_result_or_terminal_state(driver, prev_src, prev_txt, timeout=8):
 
 def record_processed(skipped=False):
     global processed_since_maintenance
+    should_pause = False
     with stats_lock:
         stats["processed"] += 1
         if skipped:
             stats["skipped"] += 1
         processed_since_maintenance += 1
+        if stats["processed"] % 50 == 0:
+            should_pause = True
+    if should_pause:
+        log("[PAUSE] Processed 50 records — waiting 60 seconds to avoid blocking")
+        time.sleep(60)
 
 
 def parse_results(html):
@@ -808,6 +833,8 @@ def process_zip(zipcode, cols, out_path, image_dir):
                     prev_txt = ""
 
                 result_state = wait_for_result_or_terminal_state(driver, prev_src, prev_txt, timeout=8)
+                # allow result page to settle
+                time.sleep(random.uniform(RESULT_WAIT_RANGE_MS[0], RESULT_WAIT_RANGE_MS[1]) / 1000.0)
                 if result_state.get("status") == "NO_DATA":
                     page_error = (result_state.get("error_text") or "").strip()
                     page_zip = result_state.get("page_zip") or ""
@@ -952,6 +979,10 @@ def run_batch(input_path, output_path):
         import selenium  # noqa: F401
     except ImportError:
         raise RuntimeError("selenium not installed. Install with: py -m pip install selenium")
+    with stats_lock:
+        stats["processed"] = 0
+        stats["skipped"] = 0
+        stats["last"] = ""
     zips = read_input_rows(input_path)
     if not zips:
         raise RuntimeError("No ZIP codes found in input.")
