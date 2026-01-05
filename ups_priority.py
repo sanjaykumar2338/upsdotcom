@@ -268,27 +268,11 @@ def close_all_browsers():
             pass
 
 
-def ensure_header(path):
-    cols = [
-        "ZIP",
-        "CITY",
-        "STATE",
-        "SHIP_DATE",
-        "LOCATION_TEXT",
-        "IMAGE_URL",
-        "IMAGE_FILE",
-        "STATUS",
-        "ERROR_STEP",
-        "ERROR_TYPE",
-        "ERROR_MESSAGE",
-        "RAW_URL",
-    ]
-
+def ensure_header_csv(path, cols):
     if (not os.path.exists(path)) or os.path.getsize(path) == 0:
         with open(path, "w", newline="", encoding="utf-8") as fp:
             csv.writer(fp).writerow(cols)
         return cols
-
     try:
         with open(path, newline="", encoding="utf-8") as fp:
             reader = csv.reader(fp)
@@ -305,7 +289,33 @@ def ensure_header(path):
     return cols
 
 
-def append_row(path, cols, row, tries=20, base_sleep=0.25):
+def ensure_header_xlsx(path, cols):
+    if not openpyxl:
+        raise RuntimeError("openpyxl not installed; required for XLSX output.")
+    from openpyxl import Workbook, load_workbook
+
+    if not os.path.exists(path) or os.path.getsize(path) == 0:
+        wb = Workbook()
+        ws = wb.active
+        ws.append(cols)
+        wb.save(path)
+        return cols
+    wb = load_workbook(path)
+    ws = wb.active
+    existing = [c.value for c in next(ws.iter_rows(max_row=1))] if ws.max_row else []
+    if existing != cols:
+        data_rows = list(ws.iter_rows(values_only=True))[1:] if ws.max_row else []
+        wb = Workbook()
+        ws = wb.active
+        ws.append(cols)
+        for r in data_rows:
+            if r:
+                ws.append(r)
+    wb.save(path)
+    return cols
+
+
+def append_row_csv(path, cols, row, tries=20, base_sleep=0.25):
     for i in range(tries):
         try:
             with write_lock, open(path, "a", newline="", encoding="utf-8") as fp:
@@ -322,6 +332,28 @@ def append_row(path, cols, row, tries=20, base_sleep=0.25):
         if fp.tell() == 0:
             w.writeheader()
         w.writerow(row)
+
+
+def append_row_xlsx(path, cols, row):
+    if not openpyxl:
+        raise RuntimeError("openpyxl not installed; required for XLSX output.")
+    from openpyxl import load_workbook
+
+    with write_lock:
+        wb = load_workbook(path)
+        ws = wb.active
+        ws.append([row.get(c, "") for c in cols])
+        wb.save(path)
+
+
+def ensure_header_any(path, cols, use_xlsx):
+    return ensure_header_xlsx(path, cols) if use_xlsx else ensure_header_csv(path, cols)
+
+
+def append_row_any(path, cols, row, use_xlsx, tries=20, base_sleep=0.25):
+    if use_xlsx:
+        return append_row_xlsx(path, cols, row)
+    return append_row_csv(path, cols, row, tries=tries, base_sleep=base_sleep)
 
 
 def make_error(error_step, error_type, message):
@@ -437,15 +469,38 @@ def load_processed_zips(path):
     processed = set()
     if not os.path.exists(path):
         return processed
-    try:
-        with open(path, newline="", encoding="utf-8") as fp:
-            reader = csv.DictReader(fp)
-            for row in reader:
-                z = (row.get("ZIP") or "").strip()
-                if z:
-                    processed.add(z)
-    except Exception:
-        pass
+    if pathlib.Path(path).suffix.lower() == ".xlsx":
+        if not openpyxl:
+            return processed
+        try:
+            from openpyxl import load_workbook
+
+            wb = load_workbook(path, read_only=True, data_only=True)
+            ws = wb.active
+            rows = list(ws.iter_rows(values_only=True))
+            wb.close()
+            if not rows:
+                return processed
+            header = [c if c is not None else "" for c in rows[0]]
+            if "ZIP" in header:
+                idx = header.index("ZIP")
+                for r in rows[1:]:
+                    if r and idx < len(r):
+                        z = str(r[idx]).strip()
+                        if z:
+                            processed.add(z)
+        except Exception:
+            pass
+    else:
+        try:
+            with open(path, newline="", encoding="utf-8") as fp:
+                reader = csv.DictReader(fp)
+                for row in reader:
+                    z = (row.get("ZIP") or "").strip()
+                    if z:
+                        processed.add(z)
+        except Exception:
+            pass
     return processed
 
 
@@ -740,7 +795,7 @@ def debug_headful(zipcode: str) -> Optional[str]:
         driver.quit()
 
 
-def process_zip(zipcode, cols, out_path, image_dir):
+def process_zip(zipcode, cols, out_path, image_dir, use_xlsx):
     zipcode_raw = str(zipcode).strip()
     zipcode = normalize_zip(zipcode_raw)
     with stats_lock:
@@ -969,7 +1024,7 @@ def process_zip(zipcode, cols, out_path, image_dir):
         "ERROR_MESSAGE": error_message or "",
         "RAW_URL": BASE_URL,
     }
-    append_row(out_path, cols, row)
+    append_row_any(out_path, cols, row, use_xlsx)
     record_processed(skipped=(status_val != "OK"))
     log(f"[{status_val}] ZIP {zipcode} | location={parsed.get('location_text','')} | img_url={'yes' if parsed.get('image_url') else 'no'} | err={error_message}")
 
@@ -979,6 +1034,7 @@ def run_batch(input_path, output_path):
         import selenium  # noqa: F401
     except ImportError:
         raise RuntimeError("selenium not installed. Install with: py -m pip install selenium")
+    use_xlsx_output = pathlib.Path(input_path).suffix.lower() == ".xlsx"
     with stats_lock:
         stats["processed"] = 0
         stats["skipped"] = 0
@@ -986,8 +1042,25 @@ def run_batch(input_path, output_path):
     zips = read_input_rows(input_path)
     if not zips:
         raise RuntimeError("No ZIP codes found in input.")
-    out_path = str(pathlib.Path(output_path).resolve())
-    cols = ensure_header(out_path)
+    out_path = pathlib.Path(output_path)
+    if use_xlsx_output and out_path.suffix.lower() != ".xlsx":
+        out_path = out_path.with_suffix(".xlsx")
+    out_path = str(out_path.resolve())
+    cols = [
+        "ZIP",
+        "CITY",
+        "STATE",
+        "SHIP_DATE",
+        "LOCATION_TEXT",
+        "IMAGE_URL",
+        "IMAGE_FILE",
+        "STATUS",
+        "ERROR_STEP",
+        "ERROR_TYPE",
+        "ERROR_MESSAGE",
+        "RAW_URL",
+    ]
+    ensure_header_any(out_path, cols, use_xlsx_output)
     already = load_processed_zips(out_path)
     if already:
         zips = [z for z in zips if z not in already]
@@ -1005,7 +1078,7 @@ def run_batch(input_path, output_path):
         log("[INFO] Image download is OFF. Only data will be saved.")
 
     with ThreadPoolExecutor(max_workers=MAX_WORKERS) as ex:
-        futs = {ex.submit(process_zip, z, cols, out_path, image_dir): z for z in zips}
+        futs = {ex.submit(process_zip, z, cols, out_path, image_dir, use_xlsx_output): z for z in zips}
         for _ in as_completed(futs):
             if stop_event.is_set():
                 break
@@ -1048,7 +1121,11 @@ def launch_gui():
         if path:
             input_var.set(path)
             if not output_var.get():
-                output_var.set(str(pathlib.Path(path).with_suffix(".csv")))
+                ext = pathlib.Path(path).suffix.lower()
+                if ext == ".xlsx":
+                    output_var.set(str(pathlib.Path(path).with_suffix(".xlsx")))
+                else:
+                    output_var.set(str(pathlib.Path(path).with_suffix(".csv")))
 
     def choose_output():
         path = filedialog.asksaveasfilename(
