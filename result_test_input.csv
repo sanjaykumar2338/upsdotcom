@@ -1,0 +1,10 @@
+ZIP,STATUS,ERROR_STEP,ERROR_TYPE,ERROR_MESSAGE,RESULT_TEXT,MAP_URL,PAGE_URL
+10001,NO_DATA,WAIT_RESULT,NO_DATA,No transit map available for this ZIP code,No results found,,https://www.fedexfreight.fedex.com/servicemaps.jsp
+90210,OK,,,,Success,https://www.fedexfreight.fedex.com/maps/SLG.pdf,https://www.fedexfreight.fedex.com/servicemaps.jsp
+60601,OK,,,,Success,https://www.fedexfreight.fedex.com/maps/CGX.pdf,https://www.fedexfreight.fedex.com/servicemaps.jsp
+33101,OK,,,,Success,https://www.fedexfreight.fedex.com/maps/MDL.pdf,https://www.fedexfreight.fedex.com/servicemaps.jsp
+98101,OK,,,,Success,https://www.fedexfreight.fedex.com/maps/SEA.pdf,https://www.fedexfreight.fedex.com/servicemaps.jsp
+75201,OK,,,,Success,https://www.fedexfreight.fedex.com/maps/EDA.pdf,https://www.fedexfreight.fedex.com/servicemaps.jsp
+60501,OK,,,,Success,https://www.fedexfreight.fedex.com/maps/CGX.pdf,https://www.fedexfreight.fedex.com/servicemaps.jsp
+20101,OK,,,,Success,https://www.fedexfreight.fedex.com/maps/WCV.pdf,https://www.fedexfreight.fedex.com/servicemaps.jsp
+60501,OK,,,,Success,https://www.fedexfreight.fedex.com/maps/CGX.pdf,https://www.fedexfreight.fedex.com/servicemaps.jsp
