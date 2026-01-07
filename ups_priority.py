@@ -59,16 +59,17 @@ HEADERS = {
 }
 HUMAN_DELAY_RANGE_MS = (3000, 4000)  # slow down per-request pacing to ~3-4 seconds
 RESULT_WAIT_RANGE_MS = (3000, 4000)  # wait on result page before parsing (3-4 seconds)
+RESULT_TIMEOUT_SEC = 40
 DEBUG_SCREENSHOT_DIR = "debug_shots"
 HEADLESS = False                  # use normal browser; set True for silent headless runs
 BLOCK_IMAGES = True
 BLOCK_FONTS = True
 os.environ.setdefault("SE_MANAGER_TELEMETRY", "0")
 INPUT_EXT_MAP = {
-    ".xlsm": "xlsx",
+    ".xlsx": "xlsx",
 }
 OUTPUT_EXT_MAP = {
-    ".xlsm": "xlsx",
+    ".xlsx": "xlsx",
 }
 
 # ---------- Thread-safe state ----------
@@ -193,8 +194,8 @@ def default_output_for_input(path: str) -> str:
     ext = p.suffix
     fmt = resolve_ext_format(ext, OUTPUT_EXT_MAP)
     if not fmt:
-        return str(p.with_name(f"{p.stem}_output.xlsm"))
-    return str(p.with_name(f"{p.stem}_output{ext if ext else '.xlsm'}"))
+        return str(p.with_name(f"{p.stem}_output.xlsx"))
+    return str(p.with_name(f"{p.stem}_output{ext if ext else '.xlsx'}"))
 
 
 def ensure_unique_output_path(p: pathlib.Path) -> pathlib.Path:
@@ -205,6 +206,12 @@ def ensure_unique_output_path(p: pathlib.Path) -> pathlib.Path:
         return p
     stamp = time.strftime("%Y%m%d_%H%M%S")
     return p.with_name(f"{p.stem}_{stamp}{p.suffix}")
+
+
+def enforce_xlsx_path(p: pathlib.Path) -> pathlib.Path:
+    if p.suffix.lower() != ".xlsx":
+        return p.with_suffix(".xlsx")
+    return p
 
 
 def _require_pandas():
@@ -252,13 +259,13 @@ def _extract_zips(df, header_row=None):
 
 def read_input_rows(path: str):
     """
-    Read ZIP rows from xlsm only, preserving leading zeros.
+    Read ZIP rows from xlsx only, preserving leading zeros.
     """
     p = pathlib.Path(path)
     ext = p.suffix.lower()
     fmt = resolve_ext_format(ext, INPUT_EXT_MAP)
     if not fmt:
-        raise RuntimeError("Unsupported input type. Use .xlsm")
+        raise RuntimeError("Unsupported input type. Please upload .xlsx")
     pd_mod = _require_pandas()
 
     def read_df():
@@ -432,14 +439,12 @@ def append_row_any(path, cols, row, use_xlsx, tries=20, base_sleep=0.25):
 def write_output_file(path: str, cols, rows):
     """
     Write rows to a file, merging with any existing output.
-    Supports .xlsm only for this project.
+    Supports .xlsx only for this project.
     """
     pd_mod = _require_pandas()
     out_path = pathlib.Path(path)
-    fmt = resolve_ext_format(out_path.suffix, OUTPUT_EXT_MAP) or "csv"
-    if fmt != "xlsx":
-        out_path = out_path.with_suffix(".xlsm")
-        fmt = "xlsx"
+    out_path = enforce_xlsx_path(out_path)
+    fmt = resolve_ext_format(out_path.suffix, OUTPUT_EXT_MAP) or "xlsx"
 
     def read_existing():
         try:
@@ -457,8 +462,24 @@ def write_output_file(path: str, cols, rows):
         df = df.drop_duplicates(subset=["ZIP"], keep="last")
     except Exception:
         pass
-
+    # ensure ZIP col is string before writing
+    if "ZIP" in df.columns:
+        df["ZIP"] = df["ZIP"].astype(str)
     df.to_excel(out_path, index=False, engine="openpyxl")
+    # enforce text format for ZIP column in Excel
+    try:
+        wb = openpyxl.load_workbook(out_path)
+        ws = wb.active
+        if "ZIP" in cols:
+            zip_idx = cols.index("ZIP") + 1  # 1-based column
+            for row in range(2, ws.max_row + 1):
+                cell = ws.cell(row=row, column=zip_idx)
+                cell.number_format = "@"
+                if cell.value is not None:
+                    cell.value = str(cell.value).zfill(5)
+        wb.save(out_path)
+    except Exception:
+        pass
     return str(out_path)
 
 
@@ -653,10 +674,15 @@ def detect_no_info_state(driver):
     return None
 
 
-def wait_for_result_or_terminal_state(driver, prev_src, prev_txt, timeout=8):
+def wait_for_result_or_terminal_state(driver, prev_src, prev_txt, timeout=RESULT_TIMEOUT_SEC, target_zip=None):
     from selenium.webdriver.common.by import By
+    from selenium.webdriver.support.ui import WebDriverWait
+    from selenium.webdriver.support import expected_conditions as EC
 
     end = time.time() + timeout
+    first_src_seen_at = None
+    last_src = prev_src or ""
+    last_bold = prev_txt or ""
 
     early = detect_no_info_state(driver)
     if early:
@@ -675,11 +701,41 @@ def wait_for_result_or_terminal_state(driver, prev_src, prev_txt, timeout=8):
             bold_txt = driver.find_element(By.CSS_SELECTOR, "span.bold").text or ""
         except Exception:
             bold_txt = ""
-        if (src and src != prev_src) or (bold_txt and bold_txt != prev_txt):
+        try:
+            body_txt = driver.find_element(By.TAG_NAME, "body").text or ""
+        except Exception:
+            body_txt = ""
+        try:
+            # Explicit wait for map element to appear; returns faster if present
+            WebDriverWait(driver, 5).until(
+                EC.presence_of_element_located((By.CSS_SELECTOR, "img#imgMap, img[src*='servicemaps']"))
+            )
+        except Exception:
+            pass
+        if src:
+            if first_src_seen_at is None:
+                first_src_seen_at = time.time()
+            last_src = src
+        if bold_txt:
+            last_bold = bold_txt
+
+        if target_zip and target_zip in body_txt:
+            return {"status": "OK", "img_src": src, "bold": bold_txt}
+
+        if src and (src != prev_src or not prev_src):
+            return {"status": "OK", "img_src": src, "bold": bold_txt}
+        if bold_txt and (bold_txt != prev_txt or not prev_txt):
+            return {"status": "OK", "img_src": src, "bold": bold_txt}
+        if src and first_src_seen_at and (time.time() - first_src_seen_at) > 2.5:
             return {"status": "OK", "img_src": src, "bold": bold_txt}
         time.sleep(0.25)
 
-    return {"status": "TIMEOUT", "err": "Timed out waiting for results OR error state", "img_src": "", "bold": ""}
+    return {
+        "status": "TIMEOUT",
+        "err": "Timed out waiting for results OR error state",
+        "img_src": last_src,
+        "bold": last_bold,
+    }
 
 
 def record_processed(skipped=False):
@@ -693,7 +749,7 @@ def record_processed(skipped=False):
         if stats["processed"] % 50 == 0:
             should_pause = True
     if should_pause:
-        log("[PAUSE] Processed 50 records — waiting 60 seconds to avoid blocking")
+        log("[PAUSE] Processed 50 records; waiting 60 seconds to avoid blocking")
         time.sleep(60)
 
 
@@ -946,6 +1002,16 @@ def process_zip(zipcode, cols, out_path, image_dir):
                     continue
 
                 try:
+                    prev_src = driver.find_element(By.CSS_SELECTOR, "img#imgMap, img[src*='servicemaps']").get_attribute("src") or ""
+                except Exception:
+                    prev_src = ""
+                prev_txt = ""
+                try:
+                    prev_txt = driver.find_element(By.CSS_SELECTOR, "span.bold").text or ""
+                except Exception:
+                    prev_txt = ""
+
+                try:
                     btn = wait.until(
                         EC.element_to_be_clickable(
                             (By.XPATH, "//button[@type='submit' or contains(., 'Submit')] | //input[@type='submit']")
@@ -957,17 +1023,14 @@ def process_zip(zipcode, cols, out_path, image_dir):
                         field.send_keys(Keys.ENTER)
                     except Exception:
                         pass
-                try:
-                    prev_src = driver.find_element(By.CSS_SELECTOR, "img#imgMap, img[src*='servicemaps']").get_attribute("src") or ""
-                except Exception:
-                    prev_src = ""
-                prev_txt = ""
-                try:
-                    prev_txt = driver.find_element(By.CSS_SELECTOR, "span.bold").text or ""
-                except Exception:
-                    prev_txt = ""
 
-                result_state = wait_for_result_or_terminal_state(driver, prev_src, prev_txt, timeout=8)
+                result_state = wait_for_result_or_terminal_state(
+                    driver,
+                    prev_src,
+                    prev_txt,
+                    timeout=RESULT_TIMEOUT_SEC,
+                    target_zip=zipcode,
+                )
                 # allow result page to settle
                 time.sleep(random.uniform(RESULT_WAIT_RANGE_MS[0], RESULT_WAIT_RANGE_MS[1]) / 1000.0)
                 if result_state.get("status") == "NO_DATA":
@@ -993,6 +1056,8 @@ def process_zip(zipcode, cols, out_path, image_dir):
                         "RESULT_TIMEOUT",
                         result_state.get("err", "Timed out waiting for results OR error state"),
                     )
+                    log(f"[TIMEOUT] ZIP {zipcode} attempt {attempts}/{MAX_RETRIES} - retrying")
+                    time.sleep(3)
                     bump_session_version()
                     continue
 
@@ -1130,13 +1195,11 @@ def run_batch(input_path, output_path):
     if not zips:
         raise RuntimeError("No ZIP codes found in input.")
     out_path_obj = pathlib.Path(output_path)
+    out_path_obj = enforce_xlsx_path(out_path_obj)
     out_fmt = resolve_ext_format(out_path_obj.suffix, OUTPUT_EXT_MAP)
     if not out_fmt:
-        log(f"[WARN] Output type {out_path_obj.suffix} not supported. Defaulting to .xlsm")
-        out_path_obj = out_path_obj.with_suffix(".xlsm")
-        out_fmt = "xlsx"
-    if input_fmt == "xlsx":
-        out_path_obj = out_path_obj.with_suffix(".xlsm")
+        log(f"[WARN] Output type {out_path_obj.suffix} not supported. Defaulting to .xlsx")
+        out_path_obj = out_path_obj.with_suffix(".xlsx")
         out_fmt = "xlsx"
     out_path_obj = ensure_unique_output_path(out_path_obj)
     out_path = str(out_path_obj.resolve())
@@ -1215,7 +1278,7 @@ def launch_gui():
     def choose_input():
         path = filedialog.askopenfilename(
             title="Select input file",
-            filetypes=[("XLSM files", "*.xlsm"), ("All files", "*.*")],
+            filetypes=[("XLSX files", "*.xlsx"), ("All files", "*.*")],
         )
         if path:
             input_var.set(path)
@@ -1226,8 +1289,8 @@ def launch_gui():
     def choose_output():
         path = filedialog.asksaveasfilename(
             title="Select output file",
-            defaultextension=".xlsm",
-            filetypes=[("XLSM files", "*.xlsm"), ("All files", "*.*")],
+            defaultextension=".xlsx",
+            filetypes=[("XLSX files", "*.xlsx"), ("All files", "*.*")],
         )
         if path:
             output_var.set(path)
@@ -1353,7 +1416,7 @@ def launch_gui():
     # Note about leading zeros
     tk.Label(
         main,
-        text="Tip: Use .xlsm files to preserve leading zeros (00001) and formatting.",
+        text="Tip: Use .xlsx files to preserve leading zeros (00001) and formatting.",
         bg=BG,
         fg=FG_SUB,
         font=("Helvetica", 10),
@@ -1406,6 +1469,20 @@ def launch_gui():
         highlightthickness=0,
         padx=4,
     ).grid(row=0, column=2, padx=6)
+    tk.Button(
+        btn_frame,
+        text="Exit",
+        command=on_close,
+        width=12,
+        bg=BTN_BG,
+        fg=BTN_FG,
+        activebackground=BTN_ACTIVE,
+        activeforeground=BTN_FG,
+        disabledforeground=BTN_DISABLED_FG,
+        relief="flat",
+        highlightthickness=0,
+        padx=4,
+    ).grid(row=0, column=3, padx=6)
 
     status_label = tk.Label(
         main,
@@ -1422,11 +1499,26 @@ def launch_gui():
 
 
 def main():
+    if len(sys.argv) >= 2 and sys.argv[1] == "--make-sample":
+        sample_path = pathlib.Path("sample_input.xlsx")
+        try:
+            wb = openpyxl.Workbook()
+            ws = wb.active
+            ws.append(["ZIP"])
+            for z in ["00501", "01002", "33101"]:
+                cell = ws.cell(row=ws.max_row + 1, column=1)
+                cell.value = z
+                cell.number_format = "@"
+            wb.save(sample_path)
+            print(f"Sample input created at {sample_path.resolve()}")
+        except Exception as e:
+            print(f"Failed to create sample: {e}")
+        return
     if len(sys.argv) >= 2:
         if sys.argv[1] == "--nogui":
             input_file = sys.argv[2] if len(sys.argv) > 2 else ""
             if not input_file:
-                print("Usage: ups_priority.py --nogui <input.xlsm> [output.xlsm]")
+                print("Usage: ups_priority.py --nogui <input.xlsx> [output.xlsx]")
                 sys.exit(1)
             output_file = sys.argv[3] if len(sys.argv) > 3 else default_output_for_input(input_file)
             final_out = run_batch(input_file, output_file)
