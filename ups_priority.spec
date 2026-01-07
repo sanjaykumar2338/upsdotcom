@@ -36,9 +36,3 @@ exe = EXE(
     codesign_identity=None,
     entitlements_file=None,
 )
-app = BUNDLE(
-    exe,
-    name='ups_priority.app',
-    icon=None,
-    bundle_identifier=None,
-)

@@ -1,0 +1,6 @@
+﻿ZIP,CITY,STATE,SHIP_DATE,LOCATION_TEXT,IMAGE_URL,IMAGE_FILE,STATUS,ERROR_STEP,ERROR_TYPE,ERROR_MESSAGE,RAW_URL
+01002,AMHERST,MA,01/07/2026,"AMHERST, MA 01002",https://www.ups.com/using/services/servicemaps/maps25/map_0004_NOV25.gif,,OK,,,,https://www.ups.com/maps/?loc=en_CB
+02108,BOSTON,MA,01/07/2026,"BOSTON, MA 02108",https://www.ups.com/using/services/servicemaps/maps25/map_0019_NOV25.gif,,OK,,,,https://www.ups.com/maps/?loc=en_CB
+00501,HOLTSVILLE,NY,01/07/2026,"HOLTSVILLE, NY 00501",https://www.ups.com/using/services/servicemaps/maps25/map_0095_NOV25.gif,,OK,,,,https://www.ups.com/maps/?loc=en_CB
+30301,ATLANTA,GA,01/07/2026,"ATLANTA, GA 30301",https://www.ups.com/using/services/servicemaps/maps25/map_0282_NOV25.gif,,OK,OFFLINE,NO_INTERNET,Internet not available; paused and retrying.,https://www.ups.com/maps/?loc=en_CB
+94105,,,,,,,SKIPPED,WAIT_RESULT,RESULT_TIMEOUT,Timed out waiting for results OR error state,https://www.ups.com/maps/?loc=en_CB

@@ -1,0 +1,5 @@
+ZIP,STATUS,ERROR_STEP,ERROR_TYPE,ERROR_MESSAGE,RESULT_TEXT,MAP_URL,PAGE_URL
+10015,NO_DATA,WAIT_RESULT,NO_DATA,No transit map available for this ZIP code,No results found,,https://www.fedexfreight.fedex.com/servicemaps.jsp
+60501,OK,,,,Success,https://www.fedexfreight.fedex.com/maps/CGX.pdf,https://www.fedexfreight.fedex.com/servicemaps.jsp
+10042,NO_DATA,WAIT_RESULT,NO_DATA,No transit map available for this ZIP code,No results found,,https://www.fedexfreight.fedex.com/servicemaps.jsp
+10046,NO_DATA,WAIT_RESULT,NO_DATA,No transit map available for this ZIP code,No results found,,https://www.fedexfreight.fedex.com/servicemaps.jsp

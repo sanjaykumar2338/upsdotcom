@@ -6,6 +6,7 @@ import csv
 import pathlib
 import threading
 import re
+import json
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from bs4 import BeautifulSoup
@@ -14,6 +15,15 @@ try:
     import openpyxl
 except ImportError:
     openpyxl = None
+
+# Optional readers/writers to support additional formats
+try:
+    import xlrd  # noqa: F401
+    import pyxlsb  # noqa: F401
+    from odf import opendocument  # noqa: F401
+    import lxml  # noqa: F401
+except Exception:
+    pass
 
 # ------------ Config ------------
 FEDEX_BASE_URL = "https://www.fedexfreight.fedex.com/servicemaps.jsp"
@@ -25,6 +35,42 @@ HUMAN_DELAY_RANGE_MS = (3000, 4000)
 PAUSE_EVERY = 100
 PAUSE_SECONDS = 60
 DEBUG_SCREENSHOT_DIR = "debug_shots"
+INPUT_EXT_MAP = {
+    ".xlsx": "xlsx",
+    ".xlsm": "xlsx",
+    ".xltx": "xlsx",
+    ".xltm": "xlsx",
+    ".xlam": "xlsx",
+    ".xls": "xls",
+    ".xlt": "xls",
+    ".xlsb": "xlsb",
+    ".ods": "ods",
+    ".csv": "csv",
+    ".tsv": "tsv",
+    ".txt": "txt",
+    ".prn": "prn",
+    ".json": "json",
+    ".xml": "xml",
+    ".slk": "slk",
+}
+OUTPUT_EXT_MAP = {
+    ".xlsx": "xlsx",
+    ".xlsm": "xlsx",
+    ".xltx": "xlsx",
+    ".xltm": "xlsx",
+    ".xlam": "xlsx",
+    ".xls": "xls",
+    ".xlt": "xls",
+    ".xlsb": "xlsb",
+    ".ods": "ods",
+    ".csv": "csv",
+    ".tsv": "tsv",
+    ".txt": "txt",
+    ".prn": "prn",
+    ".json": "json",
+    ".xml": "xml",
+    ".slk": "slk",
+}
 
 STATUS_OK = "OK"
 STATUS_NO_DATA = "NO_DATA"
@@ -46,11 +92,19 @@ stats_lock = threading.Lock()
 stop_event = threading.Event()
 stats = {"processed": 0, "skipped": 0, "total": 0}
 worker_thread_global = None
+results_rows = []
+results_lock = threading.Lock()
+NORMALIZE_TESTS = {
+    "00501": "00501",
+    "501": "00501",
+    "0501": "00501",
+    "501.0": "00501",
+}
 
 def default_output_for_input(path: str) -> str:
     p = pathlib.Path(path)
     ext = p.suffix
-    return str(p.with_name(f"result_{p.stem}{ext}"))
+    return str(p.with_name(f"result_{p.stem}{ext if ext else '.csv'}"))
 
 
 # ------------ Helpers ------------
@@ -66,134 +120,161 @@ def ensure_dir(p: pathlib.Path):
     p.parent.mkdir(parents=True, exist_ok=True)
 
 
-def ensure_header_csv(path, cols):
-    if (not os.path.exists(path)) or os.path.getsize(path) == 0:
-        with open(path, "w", newline="", encoding="utf-8") as fp:
-            csv.writer(fp).writerow(cols)
-        return cols
-    try:
-        with open(path, newline="", encoding="utf-8") as fp:
-            reader = csv.reader(fp)
-            first_row = next(reader, None)
-            if first_row != cols:
-                rows = [first_row] + list(reader) if first_row else list(reader)
-                with open(path, "w", newline="", encoding="utf-8") as out:
-                    w = csv.writer(out)
-                    w.writerow(cols)
-                    w.writerows(r for r in rows if r)
-    except Exception:
-        with open(path, "w", newline="", encoding="utf-8") as fp:
-            csv.writer(fp).writerow(cols)
-    return cols
+def normalize_zip(val) -> str:
+    s = "" if val is None else str(val).strip()
+    if not s:
+        return ""
+    # Strip trailing .0 or .00 from Excel/CSV numeric coercion
+    if re.fullmatch(r"\d+\.0+", s):
+        s = s.split(".")[0]
+    # Remove non-digits
+    s = re.sub(r"[^\d]", "", s)
+    if not s:
+        return ""
+    if len(s) < 5:
+        s = s.zfill(5)
+    return s
 
 
-def ensure_header_xlsx(path, cols):
-    if not openpyxl:
-        raise RuntimeError("openpyxl not installed; required for XLSX output.")
-    from openpyxl import Workbook, load_workbook
-
-    if not os.path.exists(path) or os.path.getsize(path) == 0:
-        wb = Workbook()
-        ws = wb.active
-        ws.append(cols)
-        wb.save(path)
-        return cols
-    wb = load_workbook(path)
-    ws = wb.active
-    existing = [c.value for c in next(ws.iter_rows(max_row=1))] if ws.max_row else []
-    if existing != cols:
-        data_rows = list(ws.iter_rows(values_only=True))[1:] if ws.max_row else []
-        wb = Workbook()
-        ws = wb.active
-        ws.append(cols)
-        for r in data_rows:
-            if r:
-                ws.append(r)
-    wb.save(path)
-    return cols
-
-
-def append_row_csv(path, cols, row, tries=20, base_sleep=0.25):
-    for i in range(tries):
-        try:
-            with write_lock, open(path, "a", newline="", encoding="utf-8") as fp:
-                w = csv.DictWriter(fp, fieldnames=cols)
-                w.writerow(row)
-                fp.flush()
-                os.fsync(fp.fileno())
-            return
-        except PermissionError:
-            time.sleep(base_sleep * (1 + i / 3.0))
-    alt = f"{os.path.splitext(path)[0]}_{os.getpid()}_{int(time.time())}.csv"
-    with write_lock, open(alt, "a", newline="", encoding="utf-8") as fp:
-        w = csv.DictWriter(fp, fieldnames=cols)
-        if fp.tell() == 0:
-            w.writeheader()
-        w.writerow(row)
-
-
-def append_row_xlsx(path, cols, row):
-    if not openpyxl:
-        raise RuntimeError("openpyxl not installed; required for XLSX output.")
-    from openpyxl import load_workbook
-
-    with write_lock:
-        wb = load_workbook(path)
-        ws = wb.active
-        ws.append([row.get(c, "") for c in cols])
-        wb.save(path)
-
-
-def ensure_header_any(path, cols, use_xlsx):
-    return ensure_header_xlsx(path, cols) if use_xlsx else ensure_header_csv(path, cols)
-
-
-def append_row_any(path, cols, row, use_xlsx):
-    if use_xlsx:
-        return append_row_xlsx(path, cols, row)
-    return append_row_csv(path, cols, row)
+def resolve_ext_format(ext: str, mapping) -> str:
+    return mapping.get(ext.lower(), "")
 
 
 def read_input_rows(path: str):
+    import pandas as pd
+
     p = pathlib.Path(path)
     ext = p.suffix.lower()
-    zips = []
-    if ext == ".csv":
-        with open(path, encoding="utf-8-sig", newline="") as f:
-            first = True
-            for row in csv.reader(f):
-                if not row:
-                    continue
-                z = str(row[0]).strip()
-                if first and not z.isdigit():
-                    first = False
-                    continue
-                first = False
-                if z:
-                    zips.append(z)
-    elif ext == ".xlsx":
-        if not openpyxl:
-            raise RuntimeError("openpyxl not installed; required for XLSX input.")
-        wb = openpyxl.load_workbook(path, read_only=True, data_only=True)
-        sheet = wb.active
-        first = True
-        for row in sheet.iter_rows(values_only=True):
-            if not row:
-                continue
-            v = row[0]
+    fmt = resolve_ext_format(ext, INPUT_EXT_MAP)
+    if not fmt:
+        raise RuntimeError("Unsupported input type.")
+
+    def first_col_to_zips(df):
+        vals = []
+        for v in df.iloc[:, 0].tolist():
             if v is None:
                 continue
-            z = str(v).strip()
-            if first and not z.isdigit():
-                first = False
-                continue
-            first = False
-            if z:
-                zips.append(z)
-        wb.close()
+            nz = normalize_zip(v)
+            if nz:
+                vals.append(nz)
+        # drop header row if it is non-numeric text
+        if vals and not vals[0].isdigit():
+            vals = vals[1:]
+        return vals
+
+    try:
+        if fmt in ("csv", "tsv", "txt", "prn"):
+            sep = "\t" if fmt in ("tsv", "prn") else None
+            df = pd.read_csv(path, sep=sep, header=None, engine="python", dtype=str)
+            return first_col_to_zips(df)
+        if fmt in ("xlsx", "xls", "xlam", "xlsm", "xltx", "xltm"):
+            engine = "xlrd" if fmt == "xls" else None
+            try:
+                df = pd.read_excel(path, engine=engine, dtype=str)
+                return first_col_to_zips(df)
+            except Exception as e:
+                if fmt == "xlam":
+                    try:
+                        df = pd.read_csv(path, sep=None, engine="python", header=None, dtype=str)
+                        return first_col_to_zips(df)
+                    except Exception:
+                        raise RuntimeError(f"xlam file could not be read as workbook ({e})")
+                raise
+        if fmt == "xlsb":
+            df = pd.read_excel(path, engine="pyxlsb", dtype=str)
+            return first_col_to_zips(df)
+        if fmt == "ods":
+            df = pd.read_excel(path, engine="odf", dtype=str)
+            return first_col_to_zips(df)
+        if fmt == "json":
+            df = pd.read_json(path, dtype=str)
+            # If JSON is a list of values, pandas will create a single column named 0
+            return first_col_to_zips(df)
+        if fmt == "xml":
+            df = pd.read_xml(path)
+            return first_col_to_zips(df)
+        if fmt == "slk":
+            # basic SYLK parsing: keep numeric tokens after 'K'
+            vals = []
+            with open(path, encoding="utf-8-sig", errors="ignore") as f:
+                for line in f:
+                    if line.startswith("ID") or line.startswith("E"):
+                        continue
+                    parts = line.strip().split(";")
+                    for part in parts:
+                        if part.startswith("K"):
+                            candidate = part[1:].strip().strip('"')
+                            if candidate:
+                                vals.append(candidate)
+            if vals and not vals[0].isdigit():
+                vals = vals[1:]
+            return vals
+    except Exception as e:
+        raise RuntimeError(f"Could not read input file: {e}")
+    raise RuntimeError("Unsupported input type.")
+
+
+def write_output_file(path: str, cols, rows):
+    import pandas as pd
+
+    p = pathlib.Path(path)
+    ext = p.suffix.lower()
+    fmt = resolve_ext_format(ext, OUTPUT_EXT_MAP) or "csv"
+    out_path = p
+
+    # handle formats that are not directly writable
+    if fmt in ("xlsb", "slk"):
+        log(f"[WARN] Writing {fmt} is not fully supported. Saving as .xlsx instead.")
+        out_path = p.with_suffix(".xlsx")
+        fmt = "xlsx"
+
+    def read_existing_dataframe():
+        try:
+            if not out_path.exists() or out_path.stat().st_size == 0:
+                return pd.DataFrame(columns=cols)
+            if fmt in ("csv", "tsv", "txt", "prn"):
+                sep = "\t" if fmt in ("tsv", "prn") else None
+                return pd.read_csv(out_path, sep=sep, dtype=str)
+            if fmt in ("xlsx", "xlsm", "xltx", "xltm", "xlam"):
+                return pd.read_excel(out_path, dtype=str)
+            if fmt in ("xls",):
+                return pd.read_excel(out_path, engine="xlrd", dtype=str)
+            if fmt == "ods":
+                return pd.read_excel(out_path, engine="odf", dtype=str)
+            if fmt == "json":
+                return pd.read_json(out_path, dtype=str)
+            if fmt == "xml":
+                return pd.read_xml(out_path)
+        except Exception:
+            return pd.DataFrame(columns=cols)
+        return pd.DataFrame(columns=cols)
+
+    existing = read_existing_dataframe()
+    new_df = pd.DataFrame(rows, columns=cols)
+    if not existing.empty:
+        df = pd.concat([existing, new_df], ignore_index=True)
     else:
-        raise RuntimeError("Unsupported input type. Use .csv or .xlsx")
-    return zips
+        df = new_df
+
+    if fmt == "csv":
+        df.to_csv(out_path, index=False, encoding="utf-8-sig")
+    elif fmt == "tsv":
+        df.to_csv(out_path, index=False, encoding="utf-8-sig", sep="\t")
+    elif fmt in ("txt", "prn"):
+        df.to_csv(out_path, index=False, encoding="utf-8-sig", sep="\t")
+    elif fmt == "json":
+        df.to_json(out_path, orient="records", indent=2, force_ascii=False)
+    elif fmt == "xml":
+        df.to_xml(out_path, index=False, root_name="rows", row_name="row", encoding="utf-8")
+    elif fmt in ("xlsx", "xlsm", "xltx", "xltm", "xlam"):
+        df.to_excel(out_path, index=False, engine="openpyxl")
+    elif fmt == "xls":
+        df.to_excel(out_path, index=False, engine="xlwt")
+    elif fmt == "ods":
+        df.to_excel(out_path, index=False, engine="odf")
+    else:
+        df.to_csv(out_path, index=False, encoding="utf-8-sig")
+    return str(out_path)
 
 
 def detect_block(body_text: str) -> bool:
@@ -373,7 +454,7 @@ def pause_if_needed():
         if stats["processed"] and stats["processed"] % PAUSE_EVERY == 0:
             should_pause = True
     if should_pause:
-        log(f"[PAUSE] Processed {PAUSE_EVERY} records — waiting {PAUSE_SECONDS} seconds to avoid blocking")
+        log(f"[PAUSE] Processed {PAUSE_EVERY} records - waiting {PAUSE_SECONDS} seconds to avoid blocking")
         time.sleep(PAUSE_SECONDS)
 
 
@@ -427,14 +508,14 @@ def ensure_fedex_ui(driver, wait):
         return None, None
 
 
-def process_zip(zipcode, cols, out_path, use_xlsx):
+def process_zip(zipcode, cols):
     if stop_event.is_set():
         return
     from selenium.webdriver.common.by import By
     from selenium.webdriver.support.ui import WebDriverWait
     from selenium.webdriver.support import expected_conditions as EC
 
-    zipcode = str(zipcode).strip()
+    zipcode = normalize_zip(zipcode)
     status = STATUS_ERROR
     error_step = ""
     error_type = ""
@@ -544,7 +625,8 @@ def process_zip(zipcode, cols, out_path, use_xlsx):
         "MAP_URL": map_url,
         "PAGE_URL": FEDEX_BASE_URL,
     }
-    append_row_any(out_path, cols, row, use_xlsx)
+    with results_lock:
+        results_rows.append(row)
     with stats_lock:
         stats["processed"] += 1
         if status != STATUS_OK:
@@ -555,6 +637,13 @@ def process_zip(zipcode, cols, out_path, use_xlsx):
 
 def run_batch(input_path, output_path):
     stop_event.clear()
+    with results_lock:
+        results_rows.clear()
+    # Quick sanity check on normalize_zip behavior
+    for k, expected in NORMALIZE_TESTS.items():
+        got = normalize_zip(k)
+        if got != expected:
+            log(f"[WARN] normalize_zip mismatch for {k}: got {got}, expected {expected}")
     zips = read_input_rows(input_path)
     if not zips:
         raise RuntimeError("No ZIP codes found in input.")
@@ -562,29 +651,31 @@ def run_batch(input_path, output_path):
         stats["total"] = len(zips)
         stats["processed"] = 0
         stats["skipped"] = 0
-    use_xlsx = pathlib.Path(input_path).suffix.lower() == ".xlsx"
-    out_path = pathlib.Path(output_path)
-    if use_xlsx and out_path.suffix.lower() != ".xlsx":
-        out_path = out_path.with_suffix(".xlsx")
-    if (not use_xlsx) and out_path.suffix.lower() != ".csv":
-        out_path = out_path.with_suffix(".csv")
-    out_path = str(out_path.resolve())
+    out_path_obj = pathlib.Path(output_path)
+    if not resolve_ext_format(out_path_obj.suffix, OUTPUT_EXT_MAP):
+        log(f"[WARN] Output type {out_path_obj.suffix} not supported. Defaulting to .csv")
+        out_path_obj = out_path_obj.with_suffix(".csv")
+    out_path = str(out_path_obj.resolve())
     cols = ["ZIP", "STATUS", "ERROR_STEP", "ERROR_TYPE", "ERROR_MESSAGE", "RESULT_TEXT", "MAP_URL", "PAGE_URL"]
-    ensure_header_any(out_path, cols, use_xlsx)
 
     with ThreadPoolExecutor(max_workers=MAX_WORKERS) as ex:
-        futs = {ex.submit(process_zip, z, cols, out_path, use_xlsx): z for z in zips}
+        futs = {ex.submit(process_zip, z, cols): z for z in zips}
         for _ in as_completed(futs):
             if stop_event.is_set():
                 break
-    log("Done.")
+    with results_lock:
+        rows_copy = list(results_rows)
+    actual_out = write_output_file(out_path, cols, rows_copy)
+    log(f"Done. Output saved to {actual_out}")
+    return actual_out
 
 
 if __name__ == "__main__":
     if len(sys.argv) >= 2:
         inp = sys.argv[1]
         outp = sys.argv[2] if len(sys.argv) > 2 else default_output_for_input(inp)
-        run_batch(inp, outp)
+        final_out = run_batch(inp, outp)
+        log(f"Output saved to {final_out}")
     else:
         import tkinter as tk
         from tkinter import filedialog, messagebox
@@ -604,7 +695,13 @@ if __name__ == "__main__":
         def choose_input():
             path = filedialog.askopenfilename(
                 title="Select input file",
-                filetypes=[("CSV/XLSX", "*.csv;*.xlsx;*.xls"), ("All files", "*.*")],
+                filetypes=[
+                    (
+                        "Data files",
+                        "*.xlsx;*.xlsm;*.xlsb;*.xltx;*.xltm;*.xlam;*.xls;*.xlt;*.ods;*.csv;*.tsv;*.txt;*.prn;*.json;*.xml;*.slk",
+                    ),
+                    ("All files", "*.*"),
+                ],
             )
             if path:
                 input_var.set(path)
@@ -615,7 +712,13 @@ if __name__ == "__main__":
             path = filedialog.asksaveasfilename(
                 title="Select output file",
                 defaultextension=".csv",
-                filetypes=[("CSV/XLSX", "*.csv;*.xlsx;*.xls"), ("All files", "*.*")],
+                filetypes=[
+                    (
+                        "Data files",
+                        "*.xlsx;*.xlsm;*.xlsb;*.xltx;*.xltm;*.xlam;*.xls;*.xlt;*.ods;*.csv;*.tsv;*.txt;*.prn;*.json;*.xml;*.slk",
+                    ),
+                    ("All files", "*.*"),
+                ],
             )
             if path:
                 output_var.set(path)
@@ -651,8 +754,8 @@ if __name__ == "__main__":
 
             def run_job():
                 try:
-                    run_batch(inp, outp)
-                    messagebox.showinfo("Scraper", f"Done. Output: {outp}")
+                    actual_out = run_batch(inp, outp)
+                    messagebox.showinfo("Scraper", f"Done. Output: {actual_out}")
                 except Exception as e:
                     messagebox.showerror("Scraper", f"Error: {e}")
 
